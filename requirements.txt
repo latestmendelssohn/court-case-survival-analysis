@@ -1,0 +1,14 @@
+duckdb>=0.10
+polars>=0.20
+pandas>=2.2
+numpy>=1.26
+lifelines>=0.28
+scikit-survival>=0.22
+pymc>=5.10
+arviz>=0.17
+scikit-learn>=1.4
+matplotlib>=3.8
+seaborn>=0.13
+plotly>=5.20
+streamlit>=1.32
+pyarrow>=15.0
