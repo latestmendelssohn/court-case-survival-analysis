@@ -1,9 +1,10 @@
 """
 Data ingestion for the Dev Data Lab judicial dataset.
 
-Loads raw yearly CSV/DTA case files with DuckDB so we never pull the full
-multi-GB dataset into memory at once. Filter down to the target states and
-years at load time, not after.
+CSV files are read and filtered with DuckDB. The official download also uses
+Stata files, which DuckDB 1.1 does not read natively, so those files use
+chunked pandas reads before the filtered rows are handed back as a DuckDB
+relation.
 """
 from __future__ import annotations
 
@@ -15,6 +16,7 @@ import duckdb
 RAW_DATA_DIR = Path(__file__).resolve().parents[1] / "data" / "raw"
 _YEAR_PATTERN = re.compile(r"(?<!\d)(?:19|20)\d{2}(?!\d)")
 _DATA_SUFFIXES = (".csv", ".csv.gz", ".dta", ".dta.gz")
+_DTA_CHUNK_SIZE = 100_000
 
 
 def _data_files(raw_dir: Path) -> list[Path]:
@@ -41,11 +43,33 @@ def list_available_years(raw_dir: Path = RAW_DATA_DIR) -> list[int]:
 
 
 def _reader_sql(path: Path) -> str:
-    """Build a safe DuckDB table-function expression for one raw file."""
+    """Build a safe DuckDB SELECT for one CSV file."""
     literal = path.resolve().as_posix().replace("'", "''")
-    if path.name.lower().endswith((".dta", ".dta.gz")):
-        return f"read_dta('{literal}')"
-    return f"read_csv_auto('{literal}', union_by_name=true)"
+    return f"SELECT * FROM read_csv_auto('{literal}', union_by_name=true)"
+
+
+def _load_stata_cases(files: list[Path], states: list[str]) -> "duckdb.DuckDBPyRelation":
+    """Read Stata files in chunks and return only rows for ``states``."""
+    import pandas as pd
+
+    filtered_chunks = []
+    columns = None
+    for path in files:
+        if path.name.lower().endswith(".dta.gz"):
+            raise ValueError("Compressed Stata files are not supported; extract the .dta file first")
+        for chunk in pd.read_stata(path, chunksize=_DTA_CHUNK_SIZE):
+            columns = chunk.columns
+            if "state" not in chunk:
+                raise KeyError(f"Missing required state column in {path}")
+            matches = chunk[chunk["state"].astype("string").isin(states)]
+            if not matches.empty:
+                filtered_chunks.append(matches)
+
+    if filtered_chunks:
+        filtered = pd.concat(filtered_chunks, ignore_index=True)
+    else:
+        filtered = pd.DataFrame(columns=columns)
+    return duckdb.from_df(filtered)
 
 
 def load_cases(
@@ -89,18 +113,17 @@ def load_cases(
             f"in {raw_dir}. Available years: {available}"
         )
 
-    source_sql = "\nUNION ALL BY NAME\n".join(_reader_sql(path) for path in files)
+    stata_files = [path for path in files if path.name.lower().endswith((".dta", ".dta.gz"))]
+    csv_files = [path for path in files if path not in stata_files]
+    if stata_files:
+        if csv_files:
+            raise ValueError("Do not mix CSV and Stata files in one load")
+        return _load_stata_cases(stata_files, requested_states)
+
+    source_sql = "\nUNION ALL BY NAME\n".join(_reader_sql(path) for path in csv_files)
     state_placeholders = ", ".join("?" for _ in requested_states)
     query = (
         f"SELECT * FROM ({source_sql}) AS cases "
         f"WHERE state IN ({state_placeholders})"
     )
-    try:
-        return duckdb.sql(query, params=requested_states)
-    except duckdb.Error as exc:
-        if any(path.name.lower().endswith((".dta", ".dta.gz")) for path in files):
-            raise RuntimeError(
-                "DuckDB could not read a DTA file. Use a DuckDB build with "
-                "read_dta support or convert the raw file to CSV."
-            ) from exc
-        raise
+    return duckdb.sql(query, params=requested_states)
