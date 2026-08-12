@@ -1,31 +1,80 @@
 """
-Competing risks: cause-specific hazards + Fine-Gray subdistribution hazard.
+Competing-risks event coding and cause-specific hazard models.
 
-Splits the single 'event' column from preprocessing into three competing
-event types: judgment, withdrawal, transfer. Every case is either censored
-(still pending) or ends via exactly one of these three causes.
+The processed data has three named disposal causes plus a large observed
+'other' category. `encode_competing_events` preserves that category as code 4,
+and `fit_cause_specific_hazards` models it explicitly as the heterogeneous
+`other_observed` endpoint. Fine-Gray remains unimplemented.
 """
 from __future__ import annotations
 
 import pandas as pd
 
 COMPETING_EVENTS = ("judgment", "withdrawal", "transfer")
+COMPETING_EVENT_CODES = {
+    "censored": 0,
+    "judgment": 1,
+    "withdrawal": 2,
+    "transfer": 3,
+    "other_observed": 4,
+}
+
+
+def encode_competing_events(
+    df: pd.DataFrame,
+    event_col: str = "event",
+    disposal_col: str = "disposal_type",
+) -> pd.DataFrame:
+    """Add a safe integer code for censored and observed event causes.
+
+    Code 4 preserves observed disposal values outside the three named causes;
+    it must not be treated as censoring until those values are resolved.
+    """
+    required = [event_col, disposal_col]
+    missing = [column for column in required if column not in df]
+    if missing:
+        raise KeyError(f"Missing required competing-risk columns: {missing}")
+
+    result = df.copy()
+    event = pd.to_numeric(result[event_col], errors="coerce")
+    if event.isna().any() or not event.isin([0, 1]).all():
+        raise ValueError(f"{event_col} must contain only 0 and 1")
+
+    labels = result[disposal_col].astype("string").str.strip().str.casefold()
+    cause = labels.map(
+        {
+            "judgment": COMPETING_EVENT_CODES["judgment"],
+            "withdrawal": COMPETING_EVENT_CODES["withdrawal"],
+            "transfer": COMPETING_EVENT_CODES["transfer"],
+        }
+    )
+    result["competing_event"] = cause.fillna(COMPETING_EVENT_CODES["other_observed"])
+    result["competing_event"] = result["competing_event"].where(event.eq(1), 0).astype("int8")
+    return result
 
 
 def fit_cause_specific_hazards(df: pd.DataFrame, covariates: list[str]) -> dict:
     """
-    Fit one Cox model per competing event type, treating the other event
-    types as censored observations for that model (standard cause-specific
-    hazards approach).
+    Fit one Cox model per observed cause, including aggregate ``other_observed``.
 
-    Returns
-    -------
-    dict[str, CoxPHFitter]
-        One fitted model per entry in COMPETING_EVENTS.
+    For each model, only the target cause is an event; all other causes and
+    right-censored rows are treated as censored, which is the standard
+    cause-specific hazards construction.
     """
-    raise NotImplementedError("TODO: for each event type, recode event column "
-                               "so only that event = 1, others = 0 (censored), "
-                               "then fit CoxPHFitter")
+    from src.survival_classical import fit_cox_ph
+
+    prepared = encode_competing_events(df)
+    models = {}
+    causes = tuple(name for name in COMPETING_EVENT_CODES if name != "censored")
+    for cause in causes:
+        cause_df = prepared.copy()
+        cause_df["event"] = (
+            prepared["competing_event"] == COMPETING_EVENT_CODES[cause]
+        ).astype("int8")
+        if not cause_df["event"].any():
+            raise ValueError(f"No observed events for cause: {cause}")
+        models[cause] = fit_cox_ph(cause_df, covariates)
+    return models
 
 
 def fit_fine_gray(df: pd.DataFrame, covariates: list[str], event_of_interest: str) -> dict:
@@ -43,5 +92,33 @@ def fit_fine_gray(df: pd.DataFrame, covariates: list[str], event_of_interest: st
 
 
 def cumulative_incidence_by_group(df: pd.DataFrame, group_col: str) -> pd.DataFrame:
-    """Compute non-parametric cumulative incidence curves per event type, per group."""
-    raise NotImplementedError("TODO")
+    """Return nonparametric cumulative-incidence curves by group and cause."""
+    from lifelines import AalenJohansenFitter
+    from src.survival_classical import _validated_survival_frame
+
+    result = _validated_survival_frame(df, group_col)
+    prepared = encode_competing_events(result)
+    curves = []
+    causes = tuple(
+        (name, code)
+        for name, code in COMPETING_EVENT_CODES.items()
+        if name != "censored"
+    )
+    for group, group_df in prepared.groupby(group_col, dropna=True, sort=False):
+        for cause, code in causes:
+            # Lifelines jitters tied integer-day durations; fixed seed keeps the result reproducible.
+            fitter = AalenJohansenFitter(seed=0).fit(
+                group_df["duration"],
+                group_df["competing_event"],
+                event_of_interest=code,
+                label=cause,
+            )
+            curve = fitter.cumulative_density_.reset_index()
+            curve.columns = ["duration", "cumulative_incidence"]
+            curve[group_col] = group
+            curve["cause"] = cause
+            curves.append(curve[[group_col, "cause", "duration", "cumulative_incidence"]])
+
+    if not curves:
+        raise ValueError(f"{group_col} must contain at least one non-null group")
+    return pd.concat(curves, ignore_index=True)
